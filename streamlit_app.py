@@ -299,6 +299,16 @@ def main():
         st.subheader("⚡ Execution Flow")
         df, final_sql = execute_self_correcting_query(user_question)
         st.session_state.generated_sql = final_sql
+        st.session_state.current_question = user_question
+
+        # --- Save query to history ---
+        if final_sql:
+            st.session_state.query_history.append({
+                'question': user_question,
+                'sql': final_sql,
+                'rows': len(df) if df is not None else 0,
+                'success': df is not None
+            })
 
         if df is not None:
             st.success(f"✅ Query executed successfully, returned {len(df)} rows.")
@@ -328,8 +338,8 @@ def main():
     # --- Query History ---
     if st.session_state.query_history:
         st.markdown("---")
-        st.subheader("📜 Query History (Last 5)")
-        for idx, item in enumerate(reversed(st.session_state.query_history[-5:])):
+        st.subheader("📜 Query History")
+        for idx, item in enumerate(reversed(st.session_state.query_history)):
             status_emoji = "✅" if item.get('success', False) else "❌"
             with st.expander(f"{status_emoji} Query {len(st.session_state.query_history)-idx}: {item['question'][:60]}..."):
                 st.markdown(f"**Question:** {item['question']}")
