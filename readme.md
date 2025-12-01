@@ -28,3 +28,5 @@ password = "some_strong_password".encode('utf-8')
 hashed = bcrypt.hashpw(password, bcrypt.gensalt())
 print(hashed.decode())
 ```
+## Deployment
+[streamlitapp](https://miniproject-2eas503.streamlit.app/)
