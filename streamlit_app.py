@@ -50,7 +50,7 @@ IMPORTANT NOTES:
 """
 
 # ----------------------
-# Login functionality (No changes needed here)
+# Login functionality
 # ----------------------
 def login_screen():
     st.title("🔐 Secure Login")
@@ -103,7 +103,9 @@ def get_db_connection():
         st.error(f"Failed to connect to database: {e}")
         return None
 
-# --- MODIFIED run_query function to return error message ---
+# ----------------------
+# Run SQL query with error handling
+# ----------------------
 def run_query(sql):
     conn = get_db_connection()
     if conn is None:
@@ -111,9 +113,8 @@ def run_query(sql):
     
     try:
         df = pd.read_sql_query(sql, conn)
-        return df, None # Success
+        return df, None
     except Exception as e:
-        # Return the error message string
         return None, str(e)
 
 # ----------------------
@@ -122,24 +123,18 @@ def run_query(sql):
 @st.cache_resource
 def get_openai_client():
     genai.configure(api_key=GOOGLE_API_KEY)
-    # Using gemini-2.5-flash for responsiveness
     return genai.GenerativeModel("gemini-2.5-flash") 
 
 def extract_sql_from_response(response_text):
-    # Regex to extract content between ```sql ... ```
     match = re.search(r"```sql\s*(.*?)\s*```", response_text, re.IGNORECASE | re.DOTALL)
     if match:
         return match.group(1).strip()
-    
-    # Fallback to cleaning the whole response if code block markers are missed
-    clean_sql = response_text.strip()
-    return clean_sql
+    return response_text.strip()
 
 def generate_sql_with_gpt(user_question, failing_sql=None, error_message=None):
     model = get_openai_client()
     
     if failing_sql and error_message:
-        # --- CORRECTION PROMPT ---
         prompt = f"""You are a PostgreSQL expert assisting a developer. Your previous query failed.
         
         **DATABASE SCHEMA CONTEXT:**
@@ -154,13 +149,12 @@ def generate_sql_with_gpt(user_question, failing_sql=None, error_message=None):
         **POSTGRESQL ERROR MESSAGE:**
         {error_message}
 
-        **TASK:** Analyze the error message and the failing query. Generate a new, corrected PostgreSQL query that fixes the issue.
+        **TASK:** Analyze the error message and generate a corrected PostgreSQL query.
         
         {POSTGRES_DIALECT_INSTRUCTIONS}
         
         Generate ONLY the corrected SQL query:"""
     else:
-        # --- INITIAL GENERATION PROMPT ---
         prompt = f"""You are a PostgreSQL expert. Given the following database schema and a user's question, generate a valid PostgreSQL query.
 
         {DATABASE_SCHEMA}
@@ -178,13 +172,12 @@ def generate_sql_with_gpt(user_question, failing_sql=None, error_message=None):
         return None
 
 # ----------------------
-# Core Execution Logic (MODIFIED)
+# Self-correcting query execution
 # ----------------------
 def execute_self_correcting_query(user_question):
     current_sql = None
     attempt = 1
     
-    # Generate initial query
     st.info(f"Attempt {attempt}: Generating initial query...")
     current_sql = generate_sql_with_gpt(user_question)
     
@@ -195,24 +188,20 @@ def execute_self_correcting_query(user_question):
         st.markdown(f"**Query Attempt {attempt}:**")
         st.code(current_sql, language="sql")
         
-        # Run the query
         df, error_message = run_query(current_sql)
         
         if error_message is None:
-            # SUCCESS
             st.success(f"✅ Success! Query executed on attempt {attempt}.")
             return df, current_sql
         
-        # FAILURE
         st.error(f"❌ Execution failed on attempt {attempt}: {error_message}")
         
         if attempt == MAX_ATTEMPTS:
             st.warning(f"Maximum correction attempts ({MAX_ATTEMPTS}) reached. Displaying last failing query.")
             return None, current_sql
 
-        # Prepare for next attempt (Self-Correction)
         attempt += 1
-        with st.spinner(f"🧠 AI is self-correcting based on the error message... (Attempt {attempt} of {MAX_ATTEMPTS})"):
+        with st.spinner(f"🧠 AI is self-correcting... (Attempt {attempt}/{MAX_ATTEMPTS})"):
             new_sql = generate_sql_with_gpt(
                 user_question=user_question,
                 failing_sql=current_sql,
@@ -225,13 +214,21 @@ def execute_self_correcting_query(user_question):
                 st.warning("AI failed to generate a new, distinct query. Stopping corrections.")
                 return None, current_sql
 
-    return None, current_sql # Should be caught by the MAX_ATTEMPTS check, but here for safety
+    return None, current_sql
 
 # ----------------------
-# Streamlit App UI
+# Streamlit UI
 # ----------------------
 def main():
     require_login()
+
+    # --- Initialize session state ---
+    if 'query_history' not in st.session_state:
+        st.session_state.query_history = []
+    if 'generated_sql' not in st.session_state:
+        st.session_state.generated_sql = None
+    if 'current_question' not in st.session_state:
+        st.session_state.current_question = None
 
     # --- Page Layout ---
     st.set_page_config(
@@ -241,7 +238,6 @@ def main():
         initial_sidebar_state="expanded"
     )
 
-    # --- Main Title ---
     st.markdown("<h1 style='text-align:center; color:#4B8BBE;'>🤖 AI-Powered SQL Query Assistant</h1>", unsafe_allow_html=True)
     st.markdown(
         "<p style='text-align:center; color:#6c757d;'>Ask questions in natural language and get PostgreSQL queries instantly. AI attempts to self-correct queries if they fail.</p>",
@@ -280,12 +276,8 @@ def main():
         st.session_state.logged_in = False
         st.rerun()
 
-    # --- User Input Section ---
+    # --- User Input ---
     st.subheader("🔎 Ask Your Question")
-    st.markdown(
-        "Enter a question in natural language. The AI will generate SQL queries automatically and attempt self-corrections if errors occur.",
-        unsafe_allow_html=True
-    )
     user_question = st.text_area(
         label="Your Question",
         placeholder="e.g., What is the total sales by product category?",
@@ -301,7 +293,7 @@ def main():
             st.session_state.generated_sql = None
             st.session_state.current_question = None
 
-    # --- Execution Flow & Results ---
+    # --- Execution Flow ---
     if generate_button and user_question:
         st.markdown("---")
         st.subheader("⚡ Execution Flow")
@@ -314,7 +306,7 @@ def main():
         else:
             st.error("❌ The AI failed to generate a successful query. Check the last generated query above.")
 
-    # --- Manual SQL Editing & Execution ---
+    # --- Manual SQL Editing ---
     if st.session_state.generated_sql and not generate_button:
         st.markdown("---")
         st.subheader("✏️ Review & Edit Last Generated SQL")
