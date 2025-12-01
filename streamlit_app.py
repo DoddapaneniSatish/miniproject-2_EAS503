@@ -150,8 +150,7 @@ def generate_sql_with_gpt(user_question, failing_sql=None, error_message=None):
         **FAILING QUERY:**
         ```sql
         {failing_sql}
-        ```
-        
+        ```        
         **POSTGRESQL ERROR MESSAGE:**
         {error_message}
 
@@ -228,159 +227,128 @@ def execute_self_correcting_query(user_question):
 
     return None, current_sql # Should be caught by the MAX_ATTEMPTS check, but here for safety
 
-
 # ----------------------
-# Streamlit App
+# Streamlit App UI
 # ----------------------
 def main():
     require_login()
-    st.title("🤖 AI-Powered SQL Query Assistant")
-    st.markdown("Ask questions in natural language, and I will generate SQL queries for you to review and run!")
-    st.markdown("---")
-    
-    # ... (Sidebar and Session State setup remains the same) ...
 
-    st.sidebar.title("💡 Example Questions")
+    # --- Page Layout ---
+    st.set_page_config(
+        page_title="AI SQL Query Assistant",
+        page_icon="🤖",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+
+    # --- Main Title ---
+    st.markdown("<h1 style='text-align:center; color:#4B8BBE;'>🤖 AI-Powered SQL Query Assistant</h1>", unsafe_allow_html=True)
+    st.markdown(
+        "<p style='text-align:center; color:#6c757d;'>Ask questions in natural language and get PostgreSQL queries instantly. AI attempts to self-correct queries if they fail.</p>",
+        unsafe_allow_html=True
+    )
+    st.markdown("---")
+
+    # --- Sidebar ---
+    st.sidebar.title("💡 Examples & Tips")
     st.sidebar.markdown("""
-Try asking questions like:
+**Try asking questions like:**
 
 **Demographics:**
 - How many customers do we have by city?
 - How many customers do we have by country?
 
 **Products & Sales:**
-- What are the top 10 products by quantity sold?
-- What is the total sales by product category?
-- How many orders per customer?
+- Top 10 products by quantity sold
+- Total sales by product category
+- Orders per customer
 
 **Orders:**
 - Average quantity ordered per order
 - Total sales per month
-- **Calculate the total amount for each order, rounded to 2 decimal places.**
+- Total amount for each order, rounded to 2 decimal places
 """)
     st.sidebar.markdown("---")
-    st.sidebar.info("""
-    🩼**How it works:**
-    1. Enter your question in plain English
-    2. AI generates SQL query
-    3. **If query fails, the AI automatically attempts to self-correct based on the database error (up to 3 times).**
-    4. Review the final successful or failing query.
-    """)
-
-    if st.sidebar.button("🚪Logout"):
+    st.sidebar.info(
+        "🩼 **How it works:**\n"
+        "1. Enter your question in plain English.\n"
+        "2. AI generates SQL query.\n"
+        "3. If the query fails, AI will attempt up to 3 self-corrections.\n"
+        "4. Review the final query and results."
+    )
+    if st.sidebar.button("🚪 Logout"):
         st.session_state.logged_in = False
         st.rerun()
 
-    # ----------------------
-    # Session state
-    # ----------------------
-    if 'query_history' not in st.session_state:
-        st.session_state.query_history = []
-    if 'generated_sql' not in st.session_state:
-        st.session_state.generated_sql = None
-    if 'current_question' not in st.session_state:
-        st.session_state.current_question = None
-    
-    # ----------------------
-    # User input
-    # ----------------------
+    # --- User Input Section ---
+    st.subheader("🔎 Ask Your Question")
+    st.markdown(
+        "Enter a question in natural language. The AI will generate SQL queries automatically and attempt self-corrections if errors occur.",
+        unsafe_allow_html=True
+    )
     user_question = st.text_area(
-        " What would you like to know?",
-        height=100,
-        placeholder="What is the total sales by product category?"
+        label="Your Question",
+        placeholder="e.g., What is the total sales by product category?",
+        height=100
     )
 
     col1, col2 = st.columns([1, 1])
     with col1:
-        generate_button = st.button(" Generate & Run SQL (Self-Correcting)", type="primary", use_container_width=True)
+        generate_button = st.button("🟢 Generate & Run SQL", type="primary", use_container_width=True)
     with col2:
-        if st.button(" Clear History", use_container_width=True):
+        if st.button("🗑 Clear History", use_container_width=True):
             st.session_state.query_history = []
             st.session_state.generated_sql = None
             st.session_state.current_question = None
 
-    # ----------------------
-    # Run SQL (using new execution logic)
-    # ----------------------
+    # --- Execution Flow & Results ---
     if generate_button and user_question:
-        user_question = user_question.strip()
-        st.session_state.current_question = user_question
-        st.session_state.generated_sql = None
-        
         st.markdown("---")
-        st.subheader("Execution Flow")
-        
+        st.subheader("⚡ Execution Flow")
         df, final_sql = execute_self_correcting_query(user_question)
-        st.session_state.generated_sql = final_sql # Store the final query (success or fail)
+        st.session_state.generated_sql = final_sql
 
         if df is not None:
-            # Success logic
-            st.session_state.query_history.append(
-                {'question': user_question, 'sql': final_sql, 'rows': len(df), 'success': True}
-            )
-            st.markdown("---")
-            st.subheader("📊 Final Query Results")
-            st.success(f"✅ Final query executed successfully, returned {len(df)} rows.")
-            st.dataframe(df, width="stretch")
+            st.success(f"✅ Query executed successfully, returned {len(df)} rows.")
+            st.dataframe(df, use_container_width=True)
         else:
-            # Failure logic
-            st.session_state.query_history.append(
-                {'question': user_question, 'sql': final_sql, 'rows': 0, 'success': False}
-            )
-            st.markdown("---")
-            st.subheader("❌ Execution Failed")
-            st.error("The AI failed to generate a successful query after all attempts. Review the last query above for manual correction.")
+            st.error("❌ The AI failed to generate a successful query. Check the last generated query above.")
 
-
-    # ----------------------
-    # Show & Run SQL (for manual review/re-run)
-    # ----------------------
-    if st.session_state.generated_sql and not generate_button: # Only show this block if a query exists and we aren't mid-run
+    # --- Manual SQL Editing & Execution ---
+    if st.session_state.generated_sql and not generate_button:
         st.markdown("---")
-        st.subheader("Last Generated/Attempted SQL Query")
+        st.subheader("✏️ Review & Edit Last Generated SQL")
         st.info(f"**Question:** {st.session_state.current_question}")
-
         edited_sql = st.text_area(
-            "Review and edit the SQL query if needed:",
+            "Edit the SQL query if needed:",
             value=st.session_state.generated_sql,
             height=200
         )
-
-        # Standard manual Run Query button
-        if st.button("Manually Run Query", type="secondary", use_container_width=True):
-             with st.spinner("Executing query ..."):
+        if st.button("Run Edited Query", type="secondary", use_container_width=True):
+            with st.spinner("Executing query..."):
                 df_manual, error_manual = run_query(edited_sql)
                 if df_manual is not None:
-                    st.markdown("---")
-                    st.subheader("📊 Manual Query Results")
-                    st.success(f"✅ Manual query returned {len(df_manual)} rows")
-                    st.dataframe(df_manual, width="stretch")
+                    st.success(f"✅ Query returned {len(df_manual)} rows")
+                    st.dataframe(df_manual, use_container_width=True)
                 else:
-                    st.error(f"❌ Manual execution failed: {error_manual}")
-                    
-    # ----------------------
-    # Query history
-    # ----------------------
+                    st.error(f"❌ Execution failed: {error_manual}")
+
+    # --- Query History ---
     if st.session_state.query_history:
-        st.markdown('---')
-        st.subheader("📜 Query History")
+        st.markdown("---")
+        st.subheader("📜 Query History (Last 5)")
         for idx, item in enumerate(reversed(st.session_state.query_history[-5:])):
             status_emoji = "✅" if item.get('success', False) else "❌"
             with st.expander(f"{status_emoji} Query {len(st.session_state.query_history)-idx}: {item['question'][:60]}..."):
                 st.markdown(f"**Question:** {item['question']}")
                 st.code(item["sql"], language="sql")
-                if item.get('success', False):
-                    st.caption(f"Returned {item['rows']} rows")
-                else:
-                    st.caption("Execution Failed (see run logs above)")
-                    
+                st.caption(f"Rows returned: {item['rows']}" if item.get('success', False) else "Execution failed")
                 if st.button(f"Re-run this query", key=f"rerun_{idx}"):
                     df_rerun, error_rerun = run_query(item["sql"])
                     if df_rerun is not None:
-                        st.dataframe(df_rerun, width="stretch")
+                        st.dataframe(df_rerun, use_container_width=True)
                     else:
                         st.error(f"❌ Rerun failed: {error_rerun}")
-
 
 if __name__ == "__main__":
     main()
