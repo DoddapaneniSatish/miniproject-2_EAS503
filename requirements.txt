@@ -4,3 +4,4 @@ psycopg2-binary
 python-dotenv
 bcrypt
 google-genai
+google-generativeai
