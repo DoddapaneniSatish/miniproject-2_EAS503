@@ -5,15 +5,12 @@ import psycopg2
 from dotenv import load_dotenv
 import google.generativeai as genai
 import bcrypt
-# Assuming utils.py is available for get_db_url
 from utils import get_db_url 
 
 # Load environment variables
 load_dotenv()
 
 # Secrets
-# NOTE: These keys/passwords must be set in Streamlit's secrets management
-# or a .env file for the application to run.
 GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 HASHED_PASSWORD = st.secrets["HASHED_PASSWORD"].encode("utf-8")
 
@@ -28,61 +25,10 @@ Requirements for PostgreSQL Queries:
 5. Format date columns correctly.
 6. Add helpful column aliases using AS.
 7. **For string concatenation (like names), use the PostgreSQL operator `||` (e.g., `FirstName || ' ' || LastName`).**
-8. **CRITICAL: When using `ROUND()`, always explicitly cast the expression to NUMERIC using `::NUMERIC` to avoid type errors. Example: `ROUND((ProductUnitPrice * QuantityOrdered)::NUMERIC, 2)`.**
+8. **CRITICAL: When using `ROUND()`, always explicitly cast the expression to NUMERIC using `::NUMERIC` to avoid type errors. Example: `ROUND((Price * Quantity)::NUMERIC, 2)`.**
 """
 
-# Full DDL for display in the schema column
-DDL_SQL = """
-DROP TABLE IF EXISTS orderdetail CASCADE;
-DROP TABLE IF EXISTS product CASCADE;
-DROP TABLE IF EXISTS productcategory CASCADE;
-DROP TABLE IF EXISTS customer CASCADE;
-DROP TABLE IF EXISTS country CASCADE;
-DROP TABLE IF EXISTS region CASCADE;
-
-CREATE TABLE region (
-    regionid    SERIAL PRIMARY KEY,
-    region      TEXT NOT NULL
-);
-
-CREATE TABLE country (
-    countryid  SERIAL PRIMARY KEY,
-    country    TEXT NOT NULL,
-    regionid   INTEGER NOT NULL REFERENCES region(regionid)
-);
-
-CREATE TABLE customer (
-    customerid SERIAL PRIMARY KEY,
-    firstname  TEXT NOT NULL,
-    lastname   TEXT NOT NULL,
-    address    TEXT NOT NULL,
-    city       TEXT NOT NULL,
-    countryid  INTEGER NOT NULL REFERENCES country(countryid)
-);
-
-CREATE TABLE productcategory (
-    productcategoryid SERIAL PRIMARY KEY,
-    productcategory   TEXT NOT NULL,
-    productcategorydescription TEXT NOT NULL
-);
-
-CREATE TABLE product (
-    productid    SERIAL PRIMARY KEY,
-    productname TEXT NOT NULL,
-    productunitprice REAL NOT NULL,
-    productcategoryid INTEGER NOT NULL REFERENCES productcategory(productcategoryid)
-);
-
-CREATE TABLE orderdetail (
-    orderid         SERIAL PRIMARY KEY,
-    customerid      INTEGER NOT NULL REFERENCES customer(customerid),
-    productid       INTEGER NOT NULL REFERENCES product(productid),
-    orderdate       DATE NOT NULL,
-    quantityordered INTEGER NOT NULL
-);
-"""
-
-# Database schema for AI context (used in generate_sql_with_gpt)
+# Database schema for AI context
 DATABASE_SCHEMA = f"""
 Database Schema:
 
@@ -199,7 +145,7 @@ def generate_sql_with_gpt(user_question, failing_sql=None, error_message=None):
         **FAILING QUERY:**
         ```sql
         {failing_sql}
-        ```         
+        ```        
         **POSTGRESQL ERROR MESSAGE:**
         {error_message}
 
@@ -330,106 +276,81 @@ def main():
         st.session_state.logged_in = False
         st.rerun()
 
-    # --- MAIN CONTENT LAYOUT: New Two-Column Structure (1:4 ratio) ---
-    col_tables, col_main = st.columns([1, 4]) 
+    # --- User Input ---
+    st.subheader("🔎 Ask Your Question")
+    user_question = st.text_area(
+        label="Your Question",
+        placeholder="e.g., What is the total sales by product category?",
+        height=100
+    )
 
-    # --- 1. Tables Column (Left - Schema Reference) ---
-    with col_tables:
-        st.subheader("📚 Schema Tables")
-        st.markdown("""
-        **Core Tables:**
-        * `OrderDetail`
-        * `Customer`
-        * `Product`
-        
-        **Lookup Tables:**
-        * `Region`
-        * `Country`
-        * `ProductCategory`
-        """)
-        
-        with st.expander("View Full DDL"):
-            st.code(DDL_SQL, language="sql")
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        generate_button = st.button("🟢 Generate & Run SQL", type="primary", use_container_width=True)
+    with col2:
+        if st.button("🗑 Clear History", use_container_width=True):
+            st.session_state.query_history = []
+            st.session_state.generated_sql = None
+            st.session_state.current_question = None
 
+    # --- Execution Flow ---
+    if generate_button and user_question:
+        st.markdown("---")
+        st.subheader("⚡ Execution Flow")
+        df, final_sql = execute_self_correcting_query(user_question)
+        st.session_state.generated_sql = final_sql
+        st.session_state.current_question = user_question
 
-    # --- 2. Main App Column (Right - Input/Output) ---
-    with col_main:
-        st.subheader("🔎 Ask Your Question")
-        user_question = st.text_area(
-            label="Your Question",
-            placeholder="e.g., What is the total sales by product category?",
-            height=100
+        # --- Save query to history ---
+        if final_sql:
+            st.session_state.query_history.append({
+                'question': user_question,
+                'sql': final_sql,
+                'rows': len(df) if df is not None else 0,
+                'success': df is not None
+            })
+
+        if df is not None:
+            st.success(f"✅ Query executed successfully, returned {len(df)} rows.")
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.error("❌ The AI failed to generate a successful query. Check the last generated query above.")
+
+    # --- Manual SQL Editing ---
+    if st.session_state.generated_sql and not generate_button:
+        st.markdown("---")
+        st.subheader("✏️ Review & Edit Last Generated SQL")
+        st.info(f"**Question:** {st.session_state.current_question}")
+        edited_sql = st.text_area(
+            "Edit the SQL query if needed:",
+            value=st.session_state.generated_sql,
+            height=200
         )
+        if st.button("Run Edited Query", type="secondary", use_container_width=True):
+            with st.spinner("Executing query..."):
+                df_manual, error_manual = run_query(edited_sql)
+                if df_manual is not None:
+                    st.success(f"✅ Query returned {len(df_manual)} rows")
+                    st.dataframe(df_manual, use_container_width=True)
+                else:
+                    st.error(f"❌ Execution failed: {error_manual}")
 
-        col1_btns, col2_btns = st.columns([1, 1])
-        with col1_btns:
-            generate_button = st.button("🟢 Generate & Run SQL", type="primary", use_container_width=True)
-        with col2_btns:
-            if st.button("🗑 Clear History", use_container_width=True):
-                st.session_state.query_history = []
-                st.session_state.generated_sql = None
-                st.session_state.current_question = None
-                st.rerun() # Use rerun to clear displayed elements below
-
-        # --- Execution Flow ---
-        if generate_button and user_question:
-            st.markdown("---")
-            st.subheader("⚡ Execution Flow")
-            df, final_sql = execute_self_correcting_query(user_question)
-            st.session_state.generated_sql = final_sql
-            st.session_state.current_question = user_question
-
-            # --- Save query to history ---
-            if final_sql:
-                st.session_state.query_history.append({
-                    'question': user_question,
-                    'sql': final_sql,
-                    'rows': len(df) if df is not None else 0,
-                    'success': df is not None
-                })
-
-            if df is not None:
-                st.success(f"✅ Query executed successfully, returned {len(df)} rows.")
-                st.dataframe(df, use_container_width=True)
-            else:
-                st.error("❌ The AI failed to generate a successful query. Check the last generated query above.")
-
-        # --- Manual SQL Editing ---
-        if st.session_state.generated_sql and not generate_button:
-            st.markdown("---")
-            st.subheader("✏️ Review & Edit Last Generated SQL")
-            st.info(f"**Question:** {st.session_state.current_question}")
-            edited_sql = st.text_area(
-                "Edit the SQL query if needed:",
-                value=st.session_state.generated_sql,
-                height=200
-            )
-            if st.button("Run Edited Query", type="secondary", use_container_width=True):
-                with st.spinner("Executing query..."):
-                    df_manual, error_manual = run_query(edited_sql)
-                    if df_manual is not None:
-                        st.success(f"✅ Query returned {len(df_manual)} rows")
-                        st.dataframe(df_manual, use_container_width=True)
+    # --- Query History ---
+    if st.session_state.query_history:
+        st.markdown("---")
+        st.subheader("📜 Query History")
+        for idx, item in enumerate(reversed(st.session_state.query_history)):
+            status_emoji = "✅" if item.get('success', False) else "❌"
+            with st.expander(f"{status_emoji} Query {len(st.session_state.query_history)-idx}: {item['question'][:60]}..."):
+                st.markdown(f"**Question:** {item['question']}")
+                st.code(item["sql"], language="sql")
+                st.caption(f"Rows returned: {item['rows']}" if item.get('success', False) else "Execution failed")
+                if st.button(f"Re-run this query", key=f"rerun_{idx}"):
+                    df_rerun, error_rerun = run_query(item["sql"])
+                    if df_rerun is not None:
+                        st.dataframe(df_rerun, use_container_width=True)
                     else:
-                        st.error(f"❌ Execution failed: {error_manual}")
-
-        # --- Query History ---
-        if st.session_state.query_history:
-            st.markdown("---")
-            st.subheader("📜 Query History")
-            # Only show history in the main column
-            for idx, item in enumerate(reversed(st.session_state.query_history)):
-                status_emoji = "✅" if item.get('success', False) else "❌"
-                with st.expander(f"{status_emoji} Query {len(st.session_state.query_history)-idx}: {item['question'][:60]}..."):
-                    st.markdown(f"**Question:** {item['question']}")
-                    st.code(item["sql"], language="sql")
-                    st.caption(f"Rows returned: {item['rows']}" if item.get('success', False) else "Execution failed")
-                    if st.button(f"Re-run this query", key=f"rerun_{idx}"):
-                        df_rerun, error_rerun = run_query(item["sql"])
-                        if df_rerun is not None:
-                            st.dataframe(df_rerun, use_container_width=True)
-                        else:
-                            st.error(f"❌ Rerun failed: {error_rerun}")
+                        st.error(f"❌ Rerun failed: {error_rerun}")
 
 if __name__ == "__main__":
     main()
