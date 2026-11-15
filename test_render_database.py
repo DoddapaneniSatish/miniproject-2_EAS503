@@ -1,27 +1,19 @@
+"""Explicit connection smoke check; never runs during import or test discovery."""
 import psycopg2
 from utils import get_db_url
 
-
-def test_postgress_connection(connection_string):
+def main():
     try:
-        conn = psycopg2.connect(connection_string)
+        conn = psycopg2.connect(get_db_url(),connect_timeout=10)
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SELECT 1')
+                assert cur.fetchone() == (1,)
+            print('Database connection successful.')
+        finally:
+            conn.close()
+    except (psycopg2.Error,ValueError):
+        raise SystemExit('Database connection failed. Check configuration and connectivity.')
 
-        cur = conn.cursor()
-
-        cur.execute("SELECT version();")
-        db_version = cur.fetchone()
-        print("Connetion successful!")
-        print(f"PostgresSQL version: {db_version}")
-
-        cur.close()
-        conn.close()
-        print("Connection closed")
-        return True
-    except Exception as e:
-        print("Connection failed")
-        print(e)
-        return False
-
-DATABASE_URL = get_db_url()
-
-test_postgress_connection(DATABASE_URL)
+if __name__ == '__main__':
+    main()
