@@ -1,356 +1,145 @@
+"""Password-gated sales SQL assistant with reviewed, bounded SELECT queries."""
+import os
 import re
-import streamlit as st
-import pandas as pd
-import psycopg2
-from dotenv import load_dotenv
-import google.generativeai as genai
+import time
 import bcrypt
-from utils import get_db_url 
+import psycopg2
+import streamlit as st
+from dotenv import load_dotenv
+from query_service import QueryRejected, run_query
+from utils import get_db_url
 
-# Load environment variables
 load_dotenv()
+SCHEMA_CONTEXT = '''Sales tables (PostgreSQL, unquoted lowercase identifiers):
+region(regionid, region)
+country(countryid, country, regionid)
+customer(customerid, firstname, lastname, address, city, countryid)
+productcategory(productcategoryid, productcategory, productcategorydescription)
+product(productid, productname, productunitprice, productcategoryid)
+orderdetail(orderid, customerid, productid, orderdate, quantityordered)
+Each orderdetail record is a LINE ITEM, not necessarily a distinct business order.
+Revenue is SUM(productunitprice * quantityordered). No profit or margin fields exist.
+Return one SELECT query, optionally with SELECT-only CTEs. Never modify data.
+Use joins via foreign keys, LIMIT 100, and NUMERIC casts for ROUND expressions.
+Use unqualified table names. Do not reference other tables, schemas or functions
+with side effects. Output SQL only; do not include explanations.'''
 
-# Secrets
-GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
-HASHED_PASSWORD = st.secrets["HASHED_PASSWORD"].encode("utf-8")
 
-# --- CONFIGURATION ---
-MAX_ATTEMPTS = 3 # Maximum times Gemini will try to correct the query
-POSTGRES_DIALECT_INSTRUCTIONS = """
-Requirements for PostgreSQL Queries:
-1. Generate ONLY the SQL query.
-2. Use proper JOINs to get descriptive names.
-3. Use SUM, AVG, COUNT when appropriate.
-4. Use LIMIT 100 for queries returning many rows.
-5. Format date columns correctly.
-6. Add helpful column aliases using AS.
-7. **For string concatenation (like names), use the PostgreSQL operator `||` (e.g., `FirstName || ' ' || LastName`).**
-8. **CRITICAL: When using `ROUND()`, always explicitly cast the expression to NUMERIC using `::NUMERIC` to avoid type errors. Example: `ROUND((Price * Quantity)::NUMERIC, 2)`.**
-"""
+def settings():
+    keys = ('DATABASE_URL','POSTGRES_USERNAME','POSTGRES_PASSWORD','POSTGRES_SERVER',
+            'POSTGRES_DATABASE','PGSSLMODE','APP_DB_SCHEMA','GOOGLE_API_KEY',
+            'GEMINI_MODEL','HASHED_PASSWORD')
+    config = {k:os.environ[k] for k in keys if k in os.environ}
+    try:
+        config.update({k:st.secrets[k] for k in keys if k in st.secrets})
+    except FileNotFoundError:
+        pass
+    return config
 
-# Database schema for AI context
-DATABASE_SCHEMA = f"""
-Database Schema:
 
-LOOKUP TABLES:
-- ProductCategory(ProductCategoryID, ProductCategory, ProductCategoryDescription)
+def extract_sql(text):
+    match = re.fullmatch(r'\s*```(?:sql)?\s*([\s\S]*?)```\s*',text,re.IGNORECASE)
+    return match.group(1).strip() if match else text.strip()
 
-CORE TABLES:
-- Region(RegionID, Region)
-- Country(CountryID, Country, RegionID)
-- Customer(CustomerID, FirstName, LastName, Address, City, CountryID)
-- Product(ProductID, ProductName, ProductUnitPrice, ProductCategoryID)
-- OrderDetail(OrderID, CustomerID, ProductID, OrderDate, QuantityOrdered)
 
-IMPORTANT NOTES:
-- OrderDate is DATE type
-- QuantityOrdered is INTEGER
-
-{POSTGRES_DIALECT_INSTRUCTIONS}
-"""
-
-# ----------------------
-# Login functionality
-# ----------------------
-def login_screen():
-    st.title("🔐 Secure Login")
-    st.markdown("---")
-    st.write("Enter your password to access the AI SQL Query Assistant.")
-    
-    password = st.text_input("Password", type="password", key="login_password")
-    
-    col1, col2, col3 = st.columns([1, 1, 2])
-    with col1:
-        login_btn = st.button("🔓 Login", type="primary", use_container_width=True)
-    
-    if login_btn:
-        if password:
+def login(config):
+    if st.session_state.get('logged_in'):
+        return
+    st.title('Sales SQL Assistant')
+    hashed = config.get('HASHED_PASSWORD')
+    if not hashed:
+        st.info('The site owner needs to configure HASHED_PASSWORD before enabling access.')
+        st.stop()
+    with st.form('login'):
+        password = st.text_input('Password',type='password',max_chars=72)
+        submitted = st.form_submit_button('Sign in')
+    if submitted:
+        attempts = [t for t in st.session_state.get('login_attempts',[]) if time.monotonic()-t < 60]
+        if len(attempts) >= 5:
+            st.warning('Please wait a minute before trying again.')
+        else:
+            st.session_state.login_attempts = attempts + [time.monotonic()]
             try:
-                if bcrypt.checkpw(password.encode('utf-8'), HASHED_PASSWORD):
+                valid = bcrypt.checkpw(password.encode(),hashed.encode())
+            except (ValueError,TypeError):
+                st.error('Login is not configured correctly. Contact the site owner.')
+            else:
+                if valid:
                     st.session_state.logged_in = True
-                    st.success("✅ Authentication successful! Redirecting...")
                     st.rerun()
                 else:
-                    st.error("❌ Incorrect password")
-            except Exception as e:
-                st.error(f"❌ Authentication error: {e}")
-        else:
-            st.warning("⚠️ Please enter a password")
-    
-    st.markdown("---")
-    st.info("""
-    **Security Notice:**
-    - Passwords are protected using bcrypt hashing
-    - Your session is secure and isolated
-    - You will remain logged in until you close the browser or click logout
-    """)
+                    st.error('Incorrect password.')
+    st.stop()
 
-def require_login():
-    if "logged_in" not in st.session_state or not st.session_state.logged_in:
-        login_screen()
-        st.stop()
 
-# ----------------------
-# Database connection
-# ----------------------
-@st.cache_resource
-def get_db_connection():
+def generate_sql(question,config):
+    from google import genai
+    client = genai.Client(api_key=config['GOOGLE_API_KEY'],http_options={'timeout':20000})
     try:
-        DATABASE_URL = get_db_url()
-        conn = psycopg2.connect(DATABASE_URL)
-        return conn
-    except Exception as e:
-        st.error(f"Failed to connect to database: {e}")
-        return None
+        response = client.models.generate_content(model=config.get('GEMINI_MODEL','gemini-2.5-flash'),
+                    contents=SCHEMA_CONTEXT+'\nUser question: '+question)
+        return extract_sql(response.text or '')
+    finally:
+        client.close()
 
-# ----------------------
-# Run SQL query with error handling
-# ----------------------
-def run_query(sql):
-    conn = get_db_connection()
-    if conn is None:
-        return None, "DB_CONNECTION_ERROR"
-    
-    try:
-        df = pd.read_sql_query(sql, conn)
-        return df, None
-    except Exception as e:
-        return None, str(e)
 
-# ----------------------
-# Gemini AI Client & SQL Generation
-# ----------------------
-@st.cache_resource
-def get_openai_client():
-    genai.configure(api_key=GOOGLE_API_KEY)
-    return genai.GenerativeModel("gemini-2.5-flash") 
-
-def extract_sql_from_response(response_text):
-    match = re.search(r"```sql\s*(.*?)\s*```", response_text, re.IGNORECASE | re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return response_text.strip()
-
-def generate_sql_with_gpt(user_question, failing_sql=None, error_message=None):
-    model = get_openai_client()
-    
-    if failing_sql and error_message:
-        prompt = f"""You are a PostgreSQL expert assisting a developer. Your previous query failed.
-        
-        **DATABASE SCHEMA CONTEXT:**
-        {DATABASE_SCHEMA}
-
-        **ORIGINAL USER QUESTION:** {user_question}
-
-        **FAILING QUERY:**
-        ```sql
-        {failing_sql}
-        ```        
-        **POSTGRESQL ERROR MESSAGE:**
-        {error_message}
-
-        **TASK:** Analyze the error message and generate a corrected PostgreSQL query.
-        
-        {POSTGRES_DIALECT_INSTRUCTIONS}
-        
-        Generate ONLY the corrected SQL query:"""
-    else:
-        prompt = f"""You are a PostgreSQL expert. Given the following database schema and a user's question, generate a valid PostgreSQL query.
-
-        {DATABASE_SCHEMA}
-
-        User Question: {user_question}
-        
-        Generate ONLY the SQL query:"""
-
-    try:
-        response = model.generate_content(prompt)
-        sql_query = extract_sql_from_response(response.text)
-        return sql_query
-    except Exception as e:
-        st.error(f"Error calling Gemini API: {e}")
-        return None
-
-# ----------------------
-# Self-correcting query execution
-# ----------------------
-def execute_self_correcting_query(user_question):
-    current_sql = None
-    attempt = 1
-    
-    st.info(f"Attempt {attempt}: Generating initial query...")
-    current_sql = generate_sql_with_gpt(user_question)
-    
-    if not current_sql:
-        return None, None
-        
-    while attempt <= MAX_ATTEMPTS:
-        st.markdown(f"**Query Attempt {attempt}:**")
-        st.code(current_sql, language="sql")
-        
-        df, error_message = run_query(current_sql)
-        
-        if error_message is None:
-            st.success(f"✅ Success! Query executed on attempt {attempt}.")
-            return df, current_sql
-        
-        st.error(f"❌ Execution failed on attempt {attempt}: {error_message}")
-        
-        if attempt == MAX_ATTEMPTS:
-            st.warning(f"Maximum correction attempts ({MAX_ATTEMPTS}) reached. Displaying last failing query.")
-            return None, current_sql
-
-        attempt += 1
-        with st.spinner(f"🧠 AI is self-correcting... (Attempt {attempt}/{MAX_ATTEMPTS})"):
-            new_sql = generate_sql_with_gpt(
-                user_question=user_question,
-                failing_sql=current_sql,
-                error_message=error_message
-            )
-            
-            if new_sql and new_sql != current_sql:
-                current_sql = new_sql
-            else:
-                st.warning("AI failed to generate a new, distinct query. Stopping corrections.")
-                return None, current_sql
-
-    return None, current_sql
-
-# ----------------------
-# Streamlit UI
-# ----------------------
 def main():
-    require_login()
-
-    # --- Initialize session state ---
-    if 'query_history' not in st.session_state:
-        st.session_state.query_history = []
-    if 'generated_sql' not in st.session_state:
-        st.session_state.generated_sql = None
-    if 'current_question' not in st.session_state:
-        st.session_state.current_question = None
-
-    # --- Page Layout ---
-    st.set_page_config(
-        page_title="AI SQL Query Assistant",
-        page_icon="🤖",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-
-    st.markdown("<h1 style='text-align:center; color:#4B8BBE;'>🤖 AI-Powered SQL Query Assistant</h1>", unsafe_allow_html=True)
-    st.markdown(
-        "<p style='text-align:center; color:#6c757d;'>Ask questions in natural language and get PostgreSQL queries instantly. AI attempts to self-correct queries if they fail.</p>",
-        unsafe_allow_html=True
-    )
-    st.markdown("---")
-
-    # --- Sidebar ---
-    st.sidebar.title("💡 Examples & Tips")
-    st.sidebar.markdown("""
-**Try asking questions like:**
-
-**Demographics:**
-- How many customers do we have by city?
-- How many customers do we have by country?
-
-**Products & Sales:**
-- Top 10 products by quantity sold
-- Total sales by product category
-- Orders per customer
-
-**Orders:**
-- Average quantity ordered per order
-- Total sales per month
-- Total amount for each order, rounded to 2 decimal places
-""")
-    st.sidebar.markdown("---")
-    st.sidebar.info(
-        "🩼 **How it works:**\n"
-        "1. Enter your question in plain English.\n"
-        "2. AI generates SQL query.\n"
-        "3. If the query fails, AI will attempt up to 3 self-corrections.\n"
-        "4. Review the final query and results."
-    )
-    if st.sidebar.button("🚪 Logout"):
-        st.session_state.logged_in = False
+    st.set_page_config(page_title='Sales SQL Assistant',page_icon='📊',layout='wide')
+    config = settings()
+    login(config)
+    st.title('Sales SQL Assistant')
+    st.caption('Explore sales data with reviewed, read-only PostgreSQL queries.')
+    if st.sidebar.button('Sign out'):
+        st.session_state.clear()
         st.rerun()
-
-    # --- User Input ---
-    st.subheader("🔎 Ask Your Question")
-    user_question = st.text_area(
-        label="Your Question",
-        placeholder="e.g., What is the total sales by product category?",
-        height=100
-    )
-
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        generate_button = st.button("🟢 Generate & Run SQL", type="primary", use_container_width=True)
-    with col2:
-        if st.button("🗑 Clear History", use_container_width=True):
+    st.sidebar.markdown('### Business questions\n- Monthly revenue and growth\n- Top product categories by revenue\n- Customer spending by country\n- Top products by units sold')
+    st.sidebar.caption('Results are limited to 500 rows. Queries time out after 5 seconds.')
+    st.session_state.setdefault('query_history',[])
+    st.session_state.setdefault('sql_editor','SELECT COUNT(*) AS line_items FROM orderdetail;')
+    question = st.text_area('Ask a sales question',max_chars=2000,
+                            placeholder='Which product categories generated the most revenue?')
+    if not config.get('GOOGLE_API_KEY'):
+        st.info('AI generation is not configured. You can still write and run reviewed SQL below.')
+    if st.button('Generate SQL',disabled=not bool(question.strip() and config.get('GOOGLE_API_KEY'))):
+        try:
+            with st.spinner('Preparing SQL for your review…'):
+                generated = generate_sql(question,config)
+            from query_service import validate_query
+            validate_query(generated,config.get('APP_DB_SCHEMA','public'))
+            st.session_state.sql_editor = generated
+            st.session_state.pop('result',None)
+        except QueryRejected as exc:
+            st.warning(str(exc))
+        except Exception:
+            st.error('AI generation is unavailable. Try again later or enter SQL manually.')
+    st.subheader('Review and run SQL')
+    st.caption('Generating SQL does not execute it. Review the query, then choose Run reviewed query.')
+    query = st.text_area('SQL query',key='sql_editor',height=220,max_chars=20000)
+    if st.button('Run reviewed query',type='primary'):
+        st.session_state.pop('result',None)
+        try:
+            with st.spinner('Running read-only query…'):
+                df = run_query(query,get_db_url(config),config.get('APP_DB_SCHEMA','public'))
+            st.session_state.result = df
+            st.session_state.query_history = ([{'sql':query,'rows':len(df)}]+st.session_state.query_history)[:20]
+        except (QueryRejected,ValueError) as exc:
+            st.error(str(exc))
+        except psycopg2.Error:
+            st.error('The query could not complete. Check the query, database availability, and SELECT-only access. Long queries stop after 5 seconds.')
+    if 'result' in st.session_state:
+        df = st.session_state.result
+        st.success(f'{len(df):,} rows returned.')
+        if df.attrs.get('truncated'):
+            st.warning('Showing the first 500 rows. Add filters or aggregation for a complete analysis.')
+        st.dataframe(df,use_container_width=True)
+    with st.expander('Database schema and metric definitions'):
+        st.code(SCHEMA_CONTEXT)
+    with st.expander('Session query history'):
+        if st.button('Clear history'):
             st.session_state.query_history = []
-            st.session_state.generated_sql = None
-            st.session_state.current_question = None
+        for item in st.session_state.query_history:
+            st.code(item['sql'],language='sql')
+            st.caption(f"{item['rows']} rows returned")
 
-    # --- Execution Flow ---
-    if generate_button and user_question:
-        st.markdown("---")
-        st.subheader("⚡ Execution Flow")
-        df, final_sql = execute_self_correcting_query(user_question)
-        st.session_state.generated_sql = final_sql
-        st.session_state.current_question = user_question
-
-        # --- Save query to history ---
-        if final_sql:
-            st.session_state.query_history.append({
-                'question': user_question,
-                'sql': final_sql,
-                'rows': len(df) if df is not None else 0,
-                'success': df is not None
-            })
-
-        if df is not None:
-            st.success(f"✅ Query executed successfully, returned {len(df)} rows.")
-            st.dataframe(df, use_container_width=True)
-        else:
-            st.error("❌ The AI failed to generate a successful query. Check the last generated query above.")
-
-    # --- Manual SQL Editing ---
-    if st.session_state.generated_sql and not generate_button:
-        st.markdown("---")
-        st.subheader("✏️ Review & Edit Last Generated SQL")
-        st.info(f"**Question:** {st.session_state.current_question}")
-        edited_sql = st.text_area(
-            "Edit the SQL query if needed:",
-            value=st.session_state.generated_sql,
-            height=200
-        )
-        if st.button("Run Edited Query", type="secondary", use_container_width=True):
-            with st.spinner("Executing query..."):
-                df_manual, error_manual = run_query(edited_sql)
-                if df_manual is not None:
-                    st.success(f"✅ Query returned {len(df_manual)} rows")
-                    st.dataframe(df_manual, use_container_width=True)
-                else:
-                    st.error(f"❌ Execution failed: {error_manual}")
-
-    # --- Query History ---
-    if st.session_state.query_history:
-        st.markdown("---")
-        st.subheader("📜 Query History")
-        for idx, item in enumerate(reversed(st.session_state.query_history)):
-            status_emoji = "✅" if item.get('success', False) else "❌"
-            with st.expander(f"{status_emoji} Query {len(st.session_state.query_history)-idx}: {item['question'][:60]}..."):
-                st.markdown(f"**Question:** {item['question']}")
-                st.code(item["sql"], language="sql")
-                st.caption(f"Rows returned: {item['rows']}" if item.get('success', False) else "Execution failed")
-                if st.button(f"Re-run this query", key=f"rerun_{idx}"):
-                    df_rerun, error_rerun = run_query(item["sql"])
-                    if df_rerun is not None:
-                        st.dataframe(df_rerun, use_container_width=True)
-                    else:
-                        st.error(f"❌ Rerun failed: {error_rerun}")
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
